@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from better_profanity import profanity
 import json
@@ -6,23 +7,25 @@ import os
 import re
 from datetime import datetime
 
-# Environment variables on Railway
+# -----------------------
+# Config / Environment
+# -----------------------
 TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID"))
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
-profanity.load_censor_words()  # default words
+tree = bot.tree
 
-# File paths
+profanity.load_censor_words()  # default blacklist
+
 WARNINGS_FILE = "warnings.json"
 LOGS_DIR = "logs/"
 
 # Ensure logs folder exists
-if not os.path.exists(LOGS_DIR):
-    os.makedirs(LOGS_DIR)
+os.makedirs(LOGS_DIR, exist_ok=True)
 
-# Load warnings or start fresh
+# Load warnings
 if not os.path.exists(WARNINGS_FILE):
     with open(WARNINGS_FILE, "w") as f:
         json.dump({}, f)
@@ -33,9 +36,9 @@ with open(WARNINGS_FILE, "r") as f:
     except json.JSONDecodeError:
         warnings_data = {}
 
-# -------------------------------
-# Utility Functions
-# -------------------------------
+# -----------------------
+# Utilities
+# -----------------------
 def save_warnings():
     with open(WARNINGS_FILE, "w") as f:
         json.dump(warnings_data, f, indent=4)
@@ -46,28 +49,26 @@ def log_action(action):
         f.write(action + "\n")
 
 def is_profanity(message_content):
-    # Check default words
+    # Default profanity
     if profanity.contains_profanity(message_content):
         return True
-    # Add extra global words / bypasses here
-    blacklisted_words = ["neger", "fuck", "bitch", "asshole", "faggot"]
+    # Custom global bypassable words
+    blacklisted_words = [
+        "neger", "fuck", "bitch", "asshole", "faggot"
+    ]
     for word in blacklisted_words:
         pattern = re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE)
         if pattern.search(message_content):
             return True
     return False
 
-# -------------------------------
-# Anti-raid variables
-# -------------------------------
-recent_joins = {}
+def is_owner(user: discord.Member):
+    return user.id == OWNER_ID or user.guild_permissions.administrator
 
-# -------------------------------
-# Events
-# -------------------------------
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is online and ready!")
+# -----------------------
+# Anti-raid
+# -----------------------
+recent_joins = {}
 
 @bot.event
 async def on_member_join(member):
@@ -75,27 +76,29 @@ async def on_member_join(member):
     if guild_id not in recent_joins:
         recent_joins[guild_id] = []
     recent_joins[guild_id].append(member.id)
-    # Anti-raid: if more than 3 join in 10 seconds, kick new members
     if len(recent_joins[guild_id]) > 3:
         for user_id in recent_joins[guild_id]:
             user = member.guild.get_member(user_id)
             if user:
                 try:
                     await user.kick(reason="Anti-raid protection")
-                    log_action(f"Anti-raid: Kicked {user} from {member.guild.name}")
+                    log_action(f"Anti-raid: Kicked {user} in {member.guild.name}")
                 except:
                     pass
         recent_joins[guild_id] = []
 
+# -----------------------
+# Message moderation
+# -----------------------
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Auto moderation
     if is_profanity(message.content):
         user_id = str(message.author.id)
         reason = f"Used blacklisted word: {message.content}"
+
         if user_id not in warnings_data:
             warnings_data[user_id] = {"count": 0, "reasons": []}
 
@@ -104,8 +107,14 @@ async def on_message(message):
         save_warnings()
 
         await message.delete()
-        await message.author.send(f"You have been warned in **{message.guild.name}** ({warnings_data[user_id]['count']}/4). Reason: {reason}")
-        await message.channel.send(f"{message.author.mention} has been warned ({warnings_data[user_id]['count']}/4).", delete_after=5)
+        await message.author.send(
+            f"You have been warned in **{message.guild.name}** "
+            f"({warnings_data[user_id]['count']}/4). Reason: {reason}"
+        )
+        await message.channel.send(
+            f"{message.author.mention} has been warned ({warnings_data[user_id]['count']}/4).",
+            delete_after=5
+        )
         log_action(f"{message.author} warned in {message.guild.name}: {reason}")
 
         if warnings_data[user_id]["count"] >= 4:
@@ -117,77 +126,81 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# -------------------------------
-# Commands
-# -------------------------------
-def is_owner(ctx):
-    if ctx.author.id == OWNER_ID:
-        return True
-    # Detect server highest role
-    if ctx.author.guild_permissions.administrator:
-        return True
-    return False
-
-@bot.command()
-async def warn(ctx, member: discord.Member, *, reason: str):
-    if not is_owner(ctx):
-        return await ctx.send("You cannot use this command.")
+# -----------------------
+# Slash Commands
+# -----------------------
+@tree.command(name="warn", description="Manually warn a user")
+@app_commands.describe(member="The member to warn", reason="Reason for warning")
+async def slash_warn(interaction: discord.Interaction, member: discord.Member, reason: str):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message("You cannot use this command.", ephemeral=True)
     user_id = str(member.id)
     if user_id not in warnings_data:
         warnings_data[user_id] = {"count": 0, "reasons": []}
     warnings_data[user_id]["count"] += 1
     warnings_data[user_id]["reasons"].append(reason)
     save_warnings()
-    await ctx.send(f"Manual warn issued to {member.mention}. Reason: {reason}")
-    await member.send(f"You have been manually warned in **{ctx.guild.name}**. Reason: {reason}")
+    await interaction.response.send_message(f"Manual warn issued to {member.mention}. Reason: {reason}")
+    await member.send(f"You have been manually warned in **{interaction.guild.name}**. Reason: {reason}")
     log_action(f"Manual warn: {member} Reason: {reason}")
 
-@bot.command()
-async def warnings(ctx, member: discord.Member):
+@tree.command(name="warnings", description="Check warnings for a user")
+@app_commands.describe(member="The member to check")
+async def slash_warnings(interaction: discord.Interaction, member: discord.Member):
     user_id = str(member.id)
     if user_id not in warnings_data:
-        return await ctx.send(f"{member} has no warnings.")
+        return await interaction.response.send_message(f"{member} has no warnings.", ephemeral=True)
     count = warnings_data[user_id]["count"]
     reasons = "\n".join(warnings_data[user_id]["reasons"])
-    await ctx.send(f"{member} has {count} warnings.\nReasons:\n{reasons}")
+    await interaction.response.send_message(f"{member} has {count} warnings.\nReasons:\n{reasons}", ephemeral=True)
 
-@bot.command()
-async def warn_list(ctx):
-    if not is_owner(ctx):
-        return await ctx.send("You cannot use this command.")
+@tree.command(name="warn_list", description="Show all warned users")
+async def slash_warn_list(interaction: discord.Interaction):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message("You cannot use this command.", ephemeral=True)
     lines = []
     for user_id, data in warnings_data.items():
-        member = ctx.guild.get_member(int(user_id))
+        member = interaction.guild.get_member(int(user_id))
         if member:
-            lines.append(f"{member}: {data['count']} warnings | Reasons: {', '.join(data['reasons'])}")
+            lines.append(f"{member}: {data['count']} warnings | {', '.join(data['reasons'])}")
     if not lines:
-        return await ctx.send("No warnings found.")
-    await ctx.send("\n".join(lines))
+        return await interaction.response.send_message("No warnings found.", ephemeral=True)
+    # Split into chunks if too long
+    chunks = [lines[i:i+10] for i in range(0, len(lines), 10)]
+    for chunk in chunks:
+        await interaction.response.send_message("\n".join(chunk), ephemeral=True)
 
-@bot.command()
-async def reset_warnings(ctx, member: discord.Member):
-    if not is_owner(ctx):
-        return await ctx.send("You cannot use this command.")
+@tree.command(name="reset_warnings", description="Reset warnings for a user")
+@app_commands.describe(member="The member to reset")
+async def slash_reset_warnings(interaction: discord.Interaction, member: discord.Member):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message("You cannot use this command.", ephemeral=True)
     user_id = str(member.id)
     if user_id in warnings_data:
         warnings_data[user_id] = {"count": 0, "reasons": []}
         save_warnings()
-    await ctx.send(f"{member} warnings reset.")
+    await interaction.response.send_message(f"{member} warnings reset.", ephemeral=True)
 
-@bot.command()
-async def unban(ctx, user_id: int):
-    if not is_owner(ctx):
-        return await ctx.send("You cannot use this command.")
-    user = await bot.fetch_user(user_id)
+@tree.command(name="unban", description="Unban a user by ID")
+@app_commands.describe(user_id="The user ID to unban")
+async def slash_unban(interaction: discord.Interaction, user_id: str):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message("You cannot use this command.", ephemeral=True)
+    user = await bot.fetch_user(int(user_id))
     for guild in bot.guilds:
         try:
             await guild.unban(user)
             log_action(f"Unbanned {user} in {guild.name}")
         except:
             pass
-    await ctx.send(f"{user} has been unbanned.")
+    await interaction.response.send_message(f"{user} has been unbanned.", ephemeral=True)
 
-# -------------------------------
-# Run bot
-# -------------------------------
+# -----------------------
+# Start bot
+# -----------------------
+@bot.event
+async def on_ready():
+    await tree.sync()
+    print(f"{bot.user} is online and ready with slash commands!")
+
 bot.run(TOKEN)
